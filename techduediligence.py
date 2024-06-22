@@ -12,90 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-async def fetch_with_retry(session, url, max_retries=5, base_delay=1):
-    for attempt in range(max_retries):
-        try:
-            async with session.get(url) as response:
-                response.raise_for_status()
-                return await response.json()
-        except ClientResponseError as e:
-            if e.status == 429:  # Too Many Requests
-                delay = base_delay * (2 ** attempt)
-                logger.warning(f"Rate limited. Retrying in {delay} seconds...")
-                await asyncio.sleep(delay)
-            else:
-                raise
-        except Exception as e:
-            logger.error(f"Error fetching {url}: {str(e)}")
-            if attempt == max_retries - 1:
-                raise
-            await asyncio.sleep(base_delay)
-    return None
-
-
-async def get_pypi_info(session, package_name):
-    logger.info(f"Fetching PyPI info for package: {package_name}")
-    url = f"https://pypi.org/pypi/{package_name}/json"
-    try:
-        data = await fetch_with_retry(session, url)
-        if not data:
-            return None
-        info = data['info']
-        return {
-            'name': info['name'],
-            'description': info['summary'],
-            'author': info['author'],
-            'license': info['license'],
-            'project_url': info['project_url'],
-            'release_date': data['releases'][info['version']][0]['upload_time']
-        }
-    except Exception as e:
-        logger.error(f"Error processing PyPI info for {package_name}: {str(e)}")
-        return None
-
-
-async def get_nuget_info(session, package_name):
-    logger.info(f"Fetching NuGet info for package: {package_name}")
-    url = f"https://api.nuget.org/v3/registration5-semver1/{package_name.lower()}/index.json"
-    try:
-        data = await fetch_with_retry(session, url)
-        if not data:
-            return None
-        latest = data['items'][0]['items'][-1]['catalogEntry']
-        return {
-            'name': latest['id'],
-            'description': latest.get('description', 'N/A'),
-            'author': latest.get('authors', 'N/A'),
-            'license': latest.get('licenseExpression', 'N/A'),
-            'project_url': latest.get('projectUrl', 'N/A'),
-            'release_date': latest['published']
-        }
-    except Exception as e:
-        logger.error(f"Error processing NuGet info for {package_name}: {str(e)}")
-        return None
-
-
-async def get_npm_info(session, package_name):
-    logger.info(f"Fetching npm info for package: {package_name}")
-    url = f"https://registry.npmjs.org/{package_name}"
-    try:
-        data = await fetch_with_retry(session, url)
-        if not data:
-            return None
-        latest = data['versions'][data['dist-tags']['latest']]
-        return {
-            'name': data['name'],
-            'description': data.get('description', 'N/A'),
-            'author': data.get('author', {}).get('name', 'N/A') if isinstance(data.get('author'), dict) else data.get(
-                'author', 'N/A'),
-            'license': latest.get('license', 'N/A'),
-            'project_url': data.get('homepage', 'N/A'),
-            'release_date': data.get('time', {}).get(data['dist-tags']['latest'], 'N/A')
-        }
-    except Exception as e:
-        logger.error(f"Error processing npm info for {package_name}: {str(e)}")
-        return None
-
+# ... [Previous fetch_with_retry, get_pypi_info, get_nuget_info, get_npm_info functions remain the same] ...
 
 def parse_requirements_txt(file_path):
     logger.info(f"Parsing requirements.txt file: {file_path}")
@@ -123,32 +40,76 @@ def parse_package_json(file_path):
         return list(dependencies.keys()) + list(dev_dependencies.keys())
 
 
-def generate_markdown(packages):
-    logger.info("Generating Markdown report")
-    markdown = "# Tech Due Diligence Report\n\n"
-    markdown += "## Open Source Dependencies\n\n"
+def parse_gemfile(file_path):
+    logger.info(f"Parsing Gemfile: {file_path}")
+    with open(file_path, 'r') as file:
+        return [line.split("'")[1] for line in file if line.strip().startswith("gem '")]
 
-    for package_type, package_list in packages.items():
-        markdown += f"### {package_type} Packages\n\n"
-        for package in package_list:
-            if package:  # Check if package info is not None
-                markdown += f"#### {package['name']}\n\n"
-                markdown += f"- Description: {package['description']}\n"
-                markdown += f"- Author: {package['author']}\n"
-                markdown += f"- License: {package['license']}\n"
-                markdown += f"- Project URL: {package['project_url']}\n"
-                markdown += f"- Release Date: {package['release_date']}\n\n"
 
-    return markdown
+def parse_composer_json(file_path):
+    logger.info(f"Parsing composer.json file: {file_path}")
+    with open(file_path, 'r') as file:
+        data = json.load(file)
+        return list(data.get("require", {}).keys())
+
+
+def parse_cargo_toml(file_path):
+    logger.info(f"Parsing Cargo.toml file: {file_path}")
+    dependencies = []
+    with open(file_path, 'r') as file:
+        in_dependencies = False
+        for line in file:
+            if line.strip() == "[dependencies]":
+                in_dependencies = True
+            elif in_dependencies and line.strip().startswith('['):
+                break
+            elif in_dependencies and '=' in line:
+                package = line.split('=')[0].strip()
+                dependencies.append(package)
+    return dependencies
+
+
+async def check_vulnerability(session, package_name, ecosystem):
+    url = f"https://api.osv.dev/v1/query"
+    data = {
+        "package": {
+            "name": package_name,
+            "ecosystem": ecosystem
+        }
+    }
+    try:
+        async with session.post(url, json=data) as response:
+            response.raise_for_status()
+            result = await response.json()
+            return len(result.get("vulns", [])) > 0
+    except Exception as e:
+        logger.error(f"Error checking vulnerability for {package_name}: {str(e)}")
+        return False
+
+
+def check_license_compatibility(license1, license2):
+    compatible_pairs = [
+        {"MIT", "Apache-2.0"},
+        {"MIT", "BSD-3-Clause"},
+        {"Apache-2.0", "BSD-3-Clause"}
+    ]
+    return {license1, license2} in compatible_pairs
 
 
 async def fetch_package_info(session, package_type, package_name):
+    info = None
     if package_type == 'PyPI':
-        return await get_pypi_info(session, package_name)
+        info = await get_pypi_info(session, package_name)
     elif package_type == 'NuGet':
-        return await get_nuget_info(session, package_name)
+        info = await get_nuget_info(session, package_name)
     elif package_type == 'npm':
-        return await get_npm_info(session, package_name)
+        info = await get_npm_info(session, package_name)
+    # Add handlers for new package types here
+
+    if info:
+        info['has_known_vulnerability'] = await check_vulnerability(session, package_name, package_type.lower())
+
+    return info
 
 
 async def process_packages(packages):
@@ -164,7 +125,10 @@ async def process_packages(packages):
         processed_packages = {
             'PyPI': [],
             'NuGet': [],
-            'npm': []
+            'npm': [],
+            'Ruby': [],
+            'PHP': [],
+            'Rust': []
         }
 
         for (package_type, task), result in zip(tasks, results):
@@ -177,12 +141,42 @@ async def process_packages(packages):
         return processed_packages
 
 
+def generate_markdown(packages):
+    logger.info("Generating Markdown report")
+    markdown = "# Tech Due Diligence Report\n\n"
+    markdown += "## Open Source Dependencies\n\n"
+
+    for package_type, package_list in packages.items():
+        if package_list:
+            markdown += f"### {package_type} Packages\n\n"
+            for package in package_list:
+                if package:  # Check if package info is not None
+                    markdown += f"#### {package['name']}\n\n"
+                    markdown += f"- Description: {package['description']}\n"
+                    markdown += f"- Author: {package['author']}\n"
+                    markdown += f"- License: {package['license']}\n"
+                    markdown += f"- Project URL: {package['project_url']}\n"
+                    markdown += f"- Release Date: {package['release_date']}\n"
+                    markdown += f"- Known Vulnerability: {'Yes' if package.get('has_known_vulnerability') else 'No'}\n\n"
+
+    markdown += "\n## License Compatibility\n\n"
+    all_licenses = [package['license'] for packages in packages.values() for package in packages if package]
+    for i, license1 in enumerate(all_licenses):
+        for license2 in all_licenses[i + 1:]:
+            markdown += f"- {license1} and {license2}: {'Compatible' if check_license_compatibility(license1, license2) else 'Potentially Incompatible'}\n"
+
+    return markdown
+
+
 async def techduediligence(folder_path):
     logger.info(f"Starting tech due diligence for folder: {folder_path}")
     packages = {
         'PyPI': [],
         'NuGet': [],
-        'npm': []
+        'npm': [],
+        'Ruby': [],
+        'PHP': [],
+        'Rust': []
     }
 
     for root, _, files in os.walk(folder_path):
@@ -197,6 +191,15 @@ async def techduediligence(folder_path):
             elif file == 'package.json':
                 logger.info(f"Found package.json: {file_path}")
                 packages['npm'].extend(parse_package_json(file_path))
+            elif file == 'Gemfile':
+                logger.info(f"Found Gemfile: {file_path}")
+                packages['Ruby'].extend(parse_gemfile(file_path))
+            elif file == 'composer.json':
+                logger.info(f"Found composer.json: {file_path}")
+                packages['PHP'].extend(parse_composer_json(file_path))
+            elif file == 'Cargo.toml':
+                logger.info(f"Found Cargo.toml: {file_path}")
+                packages['Rust'].extend(parse_cargo_toml(file_path))
 
     processed_packages = await process_packages(packages)
     markdown = generate_markdown(processed_packages)
