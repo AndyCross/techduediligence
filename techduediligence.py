@@ -2,6 +2,8 @@ import os
 import json
 import re
 import asyncio
+from collections import defaultdict
+
 import aiohttp
 import logging
 from datetime import datetime
@@ -153,10 +155,18 @@ def parse_cargo_toml(file_path):
 
 async def check_vulnerability(session, package_name, ecosystem):
     url = f"https://api.osv.dev/v1/query"
+    ecosystem_map = {
+        'PyPI': 'PyPI',
+        'NuGet': 'NuGet',
+        'npm': 'npm',
+        'Ruby': 'RubyGems',
+        'PHP': 'Packagist',
+        'Rust': 'crates.io'
+    }
     data = {
         "package": {
             "name": package_name,
-            "ecosystem": ecosystem
+            "ecosystem": ecosystem_map.get(ecosystem, ecosystem)
         }
     }
     try:
@@ -165,18 +175,8 @@ async def check_vulnerability(session, package_name, ecosystem):
             result = await response.json()
             return len(result.get("vulns", [])) > 0
     except Exception as e:
-        logger.error(f"Error checking vulnerability for {package_name}: {str(e)}")
+        logger.error(f"Error checking vulnerability for {package_name} in {ecosystem}: {str(e)}")
         return False
-
-
-def check_license_compatibility(license1, license2):
-    compatible_pairs = [
-        {"MIT", "Apache-2.0"},
-        {"MIT", "BSD-3-Clause"},
-        {"Apache-2.0", "BSD-3-Clause"}
-    ]
-    return {license1, license2} in compatible_pairs
-
 
 async def fetch_package_info(session, package_type, package_name):
     info = None
@@ -189,7 +189,7 @@ async def fetch_package_info(session, package_type, package_name):
     # Add handlers for new package types here
 
     if info:
-        info['has_known_vulnerability'] = await check_vulnerability(session, package_name, package_type.lower())
+        info['has_known_vulnerability'] = await check_vulnerability(session, package_name, package_type)
 
     return info
 
@@ -223,32 +223,88 @@ async def process_packages(packages):
         return processed_packages
 
 
+def check_license_compatibility(license1, license2):
+    if license1 == 'Unknown' or license2 == 'Unknown':
+        return False
+    compatible_pairs = [
+        {"MIT", "Apache-2.0"},
+        {"MIT", "BSD-3-Clause"},
+        {"Apache-2.0", "BSD-3-Clause"}
+    ]
+    return {license1, license2} in compatible_pairs or license1 == license2
+
+
 def generate_markdown(packages):
     logger.info("Generating Markdown report")
     markdown = "# Tech Due Diligence Report\n\n"
     markdown += "## Open Source Dependencies\n\n"
+
+    license_count = defaultdict(int)
+    all_packages = []
+    unknown_license_packages = []
 
     for package_type, package_list in packages.items():
         if package_list:
             markdown += f"### {package_type} Packages\n\n"
             for package in package_list:
                 if package:  # Check if package info is not None
+                    package['license'] = package['license'] if package['license'] not in ['N/A', '',
+                                                                                          None] else 'Unknown'
                     markdown += f"#### {package['name']}\n\n"
                     markdown += f"- Description: {package['description']}\n"
                     markdown += f"- Author: {package['author']}\n"
                     markdown += f"- License: {package['license']}\n"
                     markdown += f"- Project URL: {package['project_url']}\n"
                     markdown += f"- Release Date: {package['release_date']}\n"
+                    if package.get('deprecated', False):
+                        markdown += f"- **Note: This package may be deprecated or no longer available.**\n"
                     markdown += f"- Known Vulnerability: {'Yes' if package.get('has_known_vulnerability') else 'No'}\n\n"
 
+                    license_count[package['license']] += 1
+                    all_packages.append(package)
+                    if package['license'] == 'Unknown':
+                        unknown_license_packages.append(package)
+
+    markdown += "\n## License Summary\n\n"
+    for license, count in license_count.items():
+        if license != 'Unknown':
+            markdown += f"- {license}: {count} package(s)\n"
+
+    if license_count['Unknown'] > 0:
+        markdown += f"- Unknown: {license_count['Unknown']} package(s)\n"
+
     markdown += "\n## License Compatibility\n\n"
-    all_licenses = [package['license'] for packages in packages.values() for package in packages if package]
-    for i, license1 in enumerate(all_licenses):
-        for license2 in all_licenses[i + 1:]:
-            markdown += f"- {license1} and {license2}: {'Compatible' if check_license_compatibility(license1, license2) else 'Potentially Incompatible'}\n"
+
+    # Check compatibility only for known licenses that appear more than once
+    licenses_to_check = [license for license, count in license_count.items() if count > 1 and license != 'Unknown']
+
+    if len(licenses_to_check) > 1:
+        markdown += "### Potential Incompatibilities\n\n"
+        incompatibilities_found = False
+        for i, license1 in enumerate(licenses_to_check):
+            for license2 in licenses_to_check[i + 1:]:
+                if not check_license_compatibility(license1, license2):
+                    incompatibilities_found = True
+                    markdown += f"- {license1} may be incompatible with {license2}\n"
+                    markdown += "  Affected packages:\n"
+                    for package in all_packages:
+                        if package['license'] in [license1, license2]:
+                            markdown += f"  - {package['name']} ({package['license']})\n"
+                    markdown += "\n"
+
+        if not incompatibilities_found:
+            markdown += "No potential license incompatibilities found among known licenses.\n\n"
+    else:
+        markdown += "All packages with known licenses use the same license or there's only one package with a known license. No compatibility issues among known licenses.\n\n"
+
+    if unknown_license_packages:
+        markdown += "### Packages with Unknown Licenses\n\n"
+        markdown += "The following packages have unknown or unspecified licenses. These should be investigated further:\n\n"
+        for package in unknown_license_packages:
+            markdown += f"- {package['name']} ({package['project_url']})\n"
+        markdown += "\nNote: Packages with unknown licenses are not included in the compatibility check and may pose additional licensing risks.\n\n"
 
     return markdown
-
 
 async def techduediligence(folder_path):
     logger.info(f"Starting tech due diligence for folder: {folder_path}")
