@@ -12,7 +12,89 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-# ... [Previous fetch_with_retry, get_pypi_info, get_nuget_info, get_npm_info functions remain the same] ...
+async def fetch_with_retry(session, url, max_retries=5, base_delay=1):
+    for attempt in range(max_retries):
+        try:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                return await response.json()
+        except ClientResponseError as e:
+            if e.status == 429:  # Too Many Requests
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Rate limited. Retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+            else:
+                raise
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {str(e)}")
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(base_delay)
+    return None
+
+
+async def get_pypi_info(session, package_name):
+    logger.info(f"Fetching PyPI info for package: {package_name}")
+    url = f"https://pypi.org/pypi/{package_name}/json"
+    try:
+        data = await fetch_with_retry(session, url)
+        if not data:
+            return None
+        info = data['info']
+        return {
+            'name': info['name'],
+            'description': info['summary'],
+            'author': info['author'],
+            'license': info['license'],
+            'project_url': info['project_url'],
+            'release_date': data['releases'][info['version']][0]['upload_time']
+        }
+    except Exception as e:
+        logger.error(f"Error processing PyPI info for {package_name}: {str(e)}")
+        return None
+
+
+async def get_nuget_info(session, package_name):
+    logger.info(f"Fetching NuGet info for package: {package_name}")
+    url = f"https://api.nuget.org/v3/registration5-semver1/{package_name.lower()}/index.json"
+    try:
+        data = await fetch_with_retry(session, url)
+        if not data:
+            return None
+        latest = data['items'][0]['items'][-1]['catalogEntry']
+        return {
+            'name': latest['id'],
+            'description': latest.get('description', 'N/A'),
+            'author': latest.get('authors', 'N/A'),
+            'license': latest.get('licenseExpression', 'N/A'),
+            'project_url': latest.get('projectUrl', 'N/A'),
+            'release_date': latest['published']
+        }
+    except Exception as e:
+        logger.error(f"Error processing NuGet info for {package_name}: {str(e)}")
+        return None
+
+
+async def get_npm_info(session, package_name):
+    logger.info(f"Fetching npm info for package: {package_name}")
+    url = f"https://registry.npmjs.org/{package_name}"
+    try:
+        data = await fetch_with_retry(session, url)
+        if not data:
+            return None
+        latest = data['versions'][data['dist-tags']['latest']]
+        return {
+            'name': data['name'],
+            'description': data.get('description', 'N/A'),
+            'author': data.get('author', {}).get('name', 'N/A') if isinstance(data.get('author'), dict) else data.get(
+                'author', 'N/A'),
+            'license': latest.get('license', 'N/A'),
+            'project_url': data.get('homepage', 'N/A'),
+            'release_date': data.get('time', {}).get(data['dist-tags']['latest'], 'N/A')
+        }
+    except Exception as e:
+        logger.error(f"Error processing npm info for {package_name}: {str(e)}")
+        return None
 
 def parse_requirements_txt(file_path):
     logger.info(f"Parsing requirements.txt file: {file_path}")
